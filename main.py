@@ -23,8 +23,16 @@ from util.misc import AverageMeter, accuracy, save_model, update_json
 from transformers import AutoModel, AutoProcessor
 from transformers import Wav2Vec2Model, HubertModel, AutoFeatureExtractor
 
+from curses import meta
+import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
+
+import torch.nn.functional as F
+from sklearn.metrics import roc_curve, auc as calc_auc
+import matplotlib.pyplot as plt
+from sklearn.metrics import ConfusionMatrixDisplay, roc_auc_score, confusion_matrix
 
 def parse_args():
     parser = argparse.ArgumentParser('argument for supervised training')
@@ -115,7 +123,10 @@ def parse_args():
     args.model_name = '{}_{}_{}'.format(args.dataset, args.model, args.method)
     if args.tag:
         args.model_name += '_{}'.format(args.tag)
-    args.save_folder = os.path.join(args.save_dir, args.model_name)
+    if args.eval:
+        args.save_folder = os.path.join(args.save_dir, 'eval', args.model_name)
+    else:
+        args.save_folder = os.path.join(args.save_dir, args.model_name)
     if not os.path.isdir(args.save_folder):
         os.makedirs(args.save_folder)
 
@@ -142,33 +153,35 @@ def seed_worker(worker_id):
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
+###############################################################
+# Data Loader
+###############################################################
 def set_loader(args):
-    if args.dataset == 'psychiatry':
-        train_dataset = PsychiatryDataset(train_flag=True, args=args, annotation=args.annotation, print_flag=True)
+    if args.eval:
         val_dataset = PsychiatryDataset(train_flag=False, args=args, annotation=args.annotation, print_flag=True)
-    else:
-        raise NotImplemented
+        val_loader = torch.utils.data.DataLoader(
+        val_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True
+        )
+
+        return None, val_loader, args
     
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True,
-        worker_init_fn=seed_worker
-    )
+    else:
+    
+        train_dataset = PsychiatryDataset(train_flag=True, args=args, annotation=args.annotation, print_flag=True)
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.num_workers, pin_memory=True, drop_last=True
+        )
+        val_dataset = PsychiatryDataset(train_flag=False, args=args, annotation=args.annotation, print_flag=True)
+        val_loader = torch.utils.data.DataLoader(
+        val_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True
+        )
         
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
-                                             num_workers=args.num_workers, pin_memory=True)
+    
+        return train_loader, val_loader, args
 
-
-    return train_loader, val_loader, args
-
-from curses import meta
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 class MetaCL(nn.Module): 
     def __init__(self, temperature=0.06, weights=None): 
@@ -262,6 +275,28 @@ def set_model(args):
     else:
         domain_classifier = nn.Identity()
     
+    if args.pretrained_ckpt is not None:
+        ckpt = torch.load(args.pretrained_ckpt, map_location='cpu')
+        state_dict = ckpt['model']
+        # HOTFIX: always use dataparallel during SSL pretraining
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if "module." in k:
+                k = k.replace("module.", "")
+            if "backbone." in k:
+                k = k.replace("backbone.", "")
+            if not 'mlp_head' in k: #del mlp_head
+                new_state_dict[k] = v
+        state_dict = new_state_dict
+        model.load_state_dict(state_dict, strict=False)
+        
+        if ckpt.get('classifier', None) is not None:
+            classifier.load_state_dict(ckpt['classifier'], strict=True)
+
+        print('pretrained model loaded from: {}'.format(args.pretrained_ckpt))
+
+
+
     model.cuda()
     classifier.cuda()
     domain_classifier.cuda()
@@ -311,6 +346,18 @@ def feature_level_augment(features, time_mask_ratio=0.1, feature_mask_ratio=0.1)
             masked[b, :, f0:f0 + feat_mask_len] = 0
 
     return masked  # shape [B, T, D]
+
+def set_seed(seed): # for reproducibility
+    import torch, numpy as np, random, os
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False 
 
 def train(train_loader, model, classifier, domain_classifier, criterion, optimizer, epoch, args, scaler=None):
     model.train()
@@ -416,97 +463,23 @@ def train(train_loader, model, classifier, domain_classifier, criterion, optimiz
 
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
 
-def validate(val_loader, model, classifier, criterion, args, best_acc, best_model=None):
-    save_bool = False
+def validate(val_loader, model, classifier, criterion, args,
+             best_acc, best_model=None):
+
     model.eval()
     classifier.eval()
 
-    batch_time = AverageMeter()
-    losses = AverageMeter()
-    top1 = AverageMeter()
-    hits, counts = [0.0] * args.n_cls, [0.0] * args.n_cls
+    gender_map = {'M': 0, 'm': 0, 'F': 1, 'f': 1}
 
     all_preds = []
     all_labels = []
+    all_probs = []
+    all_genders = []
 
     with torch.no_grad():
-        end = time.time()
-        for idx, (images, labels, _) in enumerate(val_loader):
-            images = images.cuda(non_blocking=True)
-            labels = labels.cuda(non_blocking=True)
-            bsz = labels.shape[0]
-            
-
-            with torch.cuda.amp.autocast():
-                images = torch.squeeze(images, 1)
-                outputs = model(images)
-                hidden = outputs.last_hidden_state.mean(dim=1)
-                logits = classifier(hidden)
-                loss = criterion[0](logits, labels)
-
-            losses.update(loss.item(), bsz)
-
-            preds = torch.argmax(logits, dim=1)
-            all_preds.extend(preds.detach().cpu().numpy())
-            all_labels.extend(labels.detach().cpu().numpy())
-
-            
-            [acc1], _ = accuracy(logits[:bsz], labels, topk=(1,))
-            top1.update(acc1[0], bsz)
-
-            batch_time.update(time.time() - end)
-            end = time.time()
-
-            if (idx + 1) % args.print_freq == 0:
-                print('Test: [{0}/{1}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'Acc@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
-                       idx + 1, len(val_loader), batch_time=batch_time,
-                       loss=losses, top1=top1))
-        
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
-
-    # Accuracy, Precision, Recall, F1-score
-    acc = accuracy_score(all_labels, all_preds)
-    precision = precision_score(all_labels, all_preds, average='binary' if args.n_cls == 2 else 'macro')
-    recall = recall_score(all_labels, all_preds, average='binary' if args.n_cls == 2 else 'macro')
-    f1 = f1_score(all_labels, all_preds, average='binary' if args.n_cls == 2 else 'macro')
-
-    print(f"\nEvaluation Results:")
-    print(f"  Accuracy : {acc * 100:.2f}%")
-    print(f"  Precision: {precision * 100:.2f}%")
-    print(f"  Recall   : {recall * 100:.2f}%")
-    print(f"  F1-Score : {f1 * 100:.2f}%\n")
-    
-    
-    if f1 > best_acc[-1]:
-        save_bool = True
-        best_acc = [acc, precision, recall, f1]  # save all metrics
-        best_model = [deepcopy(model.state_dict()), deepcopy(classifier.state_dict())]
-        print(f"✅ Best model updated (F1 = {f1:.4f})")
-    
-    print("Best F1: {}".format(best_acc))
-
-    return best_acc, best_model, save_bool
-
-def validate_by_gender(val_loader, model, classifier, criterion, args):
-    model.eval()
-    classifier.eval()
-
-    all_preds, all_labels, all_genders = [], [], []
-
-    with torch.no_grad():
-        for batch in val_loader:
-            if len(batch) == 3:
-                images, labels, genders = batch
-            else:
-                images, labels = batch
-                genders = ['unknown'] * len(labels)
-
-            images = images.cuda(non_blocking=True)
-            labels = labels.cuda(non_blocking=True)
+        for images, labels, genders in val_loader:
+            images = images.cuda()
+            labels = labels.cuda()
 
             with torch.cuda.amp.autocast():
                 images = torch.squeeze(images, 1)
@@ -515,163 +488,386 @@ def validate_by_gender(val_loader, model, classifier, criterion, args):
                 logits = classifier(hidden)
 
             preds = torch.argmax(logits, dim=1)
-            all_preds.extend(preds.detach().cpu().numpy())
-            all_labels.extend(labels.detach().cpu().numpy())
-            all_genders.extend(genders)
+            probs = F.softmax(logits, dim=1)[:, 1]
+
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+
+            # 🔥 gender 통일
+            genders_clean = []
+            for g in genders:
+                if isinstance(g, str):
+                    genders_clean.append(gender_map[g])
+                else:
+                    genders_clean.append(int(g))
+
+            all_genders.extend(genders_clean)
 
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
+    all_probs = np.array(all_probs)
     all_genders = np.array(all_genders)
 
+    # Metrics
+    acc = accuracy_score(all_labels, all_preds)
+    precision = precision_score(all_labels, all_preds)
+    recall = recall_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds)
+    auc = roc_auc_score(all_labels, all_probs)
+    cm = confusion_matrix(all_labels, all_preds)
+
+    if f1 > best_acc[-1]:
+        best_acc = [acc, precision, recall, f1, auc]
+        best_model = [deepcopy(model.state_dict()), deepcopy(classifier.state_dict())]
+        save_bool = True
+
+    return best_acc, best_model, save_bool, cm, auc, all_labels, all_preds, all_probs, all_genders
+
+
+
+###############################################################
+# Gender-wise
+###############################################################
+def validate_by_gender(all_labels, all_preds, all_probs, all_genders, args):
+
+    results = {}
     gender_groups = np.unique(all_genders)
-    gender_results = {}
 
     for gender in gender_groups:
         idxs = np.where(all_genders == gender)[0]
-        y_true, y_pred = all_labels[idxs], all_preds[idxs]
+
+        y_true = all_labels[idxs]
+        y_pred = all_preds[idxs]
+        y_prob = all_probs[idxs]
 
         acc = accuracy_score(y_true, y_pred)
-        precision = precision_score(y_true, y_pred, average='binary' if args.n_cls == 2 else 'macro')
-        recall = recall_score(y_true, y_pred, average='binary' if args.n_cls == 2 else 'macro')
-        f1 = f1_score(y_true, y_pred, average='binary' if args.n_cls == 2 else 'macro')
+        precision = precision_score(y_true, y_pred)
+        recall = recall_score(y_true, y_pred)
+        f1 = f1_score(y_true, y_pred)
 
-        gender_results[gender] = {
-            "Accuracy": round(acc, 4),
-            "Precision": round(precision, 4),
-            "Recall": round(recall, 4),
-            "F1": round(f1, 4),
-            "Samples": int(len(y_true))
+        try:
+            auc = roc_auc_score(y_true, y_prob)
+        except:
+            auc = None
+
+        results[str(gender)] = {
+            "Samples": len(y_true),
+            "Accuracy": acc,
+            "Precision": precision,
+            "Recall": recall,
+            "F1": f1,
+            "AUC": auc
         }
 
-    print("\n====== Gender-wise Results ======")
-    for g, m in gender_results.items():
-        print(f"Gender: {g}")
-        print(f"  #Samples : {m['Samples']}")
-        print(f"  Accuracy : {m['Accuracy']*100:.2f}%")
-        print(f"  Precision: {m['Precision']*100:.2f}%")
-        print(f"  Recall   : {m['Recall']*100:.2f}%")
-        print(f"  F1-Score : {m['F1']*100:.2f}%\n")
-    print("=================================\n")
+    return results
 
-    return gender_results
+def extract_embeddings(data_loader, model, classifier, device="cuda"):
+    model.eval()
+    classifier.eval()
 
+    embeddings = []
+    labels = []
+    genders = []
 
-def set_seed(seed): # for reproducibility
-    import torch, numpy as np, random, os
+    gender_map = {'M': 0, 'm': 0, 'F': 1, 'f': 1}
 
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    with torch.no_grad():
+        for images, y, g in data_loader:
+            images = images.to(device)
+            y = y.to(device)
 
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False 
+            images = torch.squeeze(images, 1)
+            outputs = model(images)
+            hidden = outputs.last_hidden_state.mean(dim=1)
 
+            # embedding 저장
+            embeddings.append(hidden.cpu().numpy())
+            labels.append(y.cpu().numpy())
 
+            # gender 저장
+            g_clean = []
+            for item in g:
+                if isinstance(item, str):
+                    g_clean.append(gender_map[item])
+                else:
+                    g_clean.append(int(item))
+            genders.append(np.array(g_clean))
+
+    embeddings = np.vstack(embeddings)     # [N, 768]
+    labels = np.hstack(labels)             # [N]
+    genders = np.hstack(genders)           # [N]
+
+    return embeddings, labels, genders
+
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+
+def plot_tsne_paper_style(embeddings, targets, class_names, save_path, title="t-SNE"):
+    
+    tsne = TSNE(
+        n_components=2,
+        perplexity=30,
+        learning_rate=200,
+        n_iter=1000,
+        init='pca',
+        random_state=42
+    )
+    emb_2d = tsne.fit_transform(embeddings)
+
+    # 색상 (필요한 만큼 확장 가능)
+    color_map = {
+        0: "#E64B35FF",  # Red-ish
+        1: "#4DBBD5FF",  # Blue-ish
+        2: "#00A087FF",  # Green-ish
+        3: "#3C5488FF",  # Navy
+        4: "#F39B7FFF"
+    }
+
+    plt.figure(figsize=(8, 7))
+
+    for cls in np.unique(targets):
+        idxs = np.where(targets == cls)[0]
+
+        plt.scatter(
+            emb_2d[idxs, 0],
+            emb_2d[idxs, 1],
+            s=18,
+            alpha=0.75,
+            linewidth=0.3,
+            edgecolors='black',
+            color=color_map.get(cls, '#333333'),
+            label=class_names[cls]
+        )
+
+    # === 축 이름 ===
+    plt.xlabel("comp-1", fontsize=14)
+    plt.ylabel("comp-2", fontsize=14)
+
+    # === 제목 ===
+    plt.title(title, fontsize=16)
+
+    # === grid ===
+    plt.grid(True, linestyle='--', alpha=0.4)
+
+    # === legend 박스 ===
+    plt.legend(
+        frameon=True,
+        facecolor='white',
+        edgecolor='black',
+        fontsize=12,
+        loc='upper right'
+    )
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+
+    print(f"[SAVED] {save_path}")
+
+###############################################################
+# MAIN
+###############################################################
 def main():
+
     args = parse_args()
+    set_seed(args.seed)
+
     with open(os.path.join(args.save_folder, 'train_args.json'), 'w') as f:
         json.dump(vars(args), f, indent=4)
-        
-    #torch.autograd.set_detect_anomaly(True)
 
-    # fix seed
-    set_seed(args.seed)
-    
-    best_model = None
-    if args.dataset == 'psychiatry':
-        best_acc = [0, 0, 0, 0]  # Acc, Precision, Recall, F1
-    
     train_loader, val_loader, args = set_loader(args)
+
     model, classifier, domain_classifier, criterion, optimizer = set_model(args)
 
-    if args.resume:
-        if os.path.isfile(args.resume):
-            print("=> loading checkpoint '{}'".format(args.resume))
-            checkpoint = torch.load(args.resume)
+    if args.resume: 
+        if os.path.isfile(args.resume): 
+            print("=> loading checkpoint '{}'".format(args.resume)) 
+            checkpoint = torch.load(args.resume) 
             args.start_epoch = checkpoint['epoch'] 
-            model.load_state_dict(checkpoint['model'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            args.start_epoch += 1
-            print("=> loaded checkpoint '{}' (epoch {})".format(args.resume, checkpoint['epoch']))
-        else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
-    else:
+            model.load_state_dict(checkpoint['model']) 
+            optimizer.load_state_dict(checkpoint['optimizer']) 
+            args.start_epoch += 1 
+            print("=> loaded checkpoint '{}' (epoch {})".format(args.resume, checkpoint['epoch'])) 
+        else: 
+            print("=> no checkpoint found at '{}'".format(args.resume)) 
+    else: 
         args.start_epoch = 1
-
-    # use mix_precision:
-    scaler = torch.cuda.amp.GradScaler()
     
-    print('*' * 20)
-     
+
+
+    scaler = torch.cuda.amp.GradScaler()
+
+    best_acc = [0, 0, 0, 0, 0]  
+    best_model = None
+
+    ###############################################################
+    # TRAIN
+    ###############################################################
     if not args.eval:
-        print('Experiments {} start'.format(args.model_name))
-        print('Training for {} epochs on {} dataset'.format(args.epochs, args.dataset))
-        
-        for epoch in range(args.start_epoch, args.epochs+1):
+        print("Start training...")
+
+        for epoch in range(1, args.epochs + 1):
+
             adjust_learning_rate(args, optimizer, epoch)
 
-            # train for one epoch
-            time1 = time.time()
-            
-            loss, acc = train(train_loader, model, classifier, domain_classifier, criterion, optimizer, epoch, args, scaler)
-            time2 = time.time()
-            print('Train epoch {}, total time {:.2f}, accuracy:{:.2f}'.format(epoch, time2-time1, acc))
-            
-            # eval for one epoch
-            #best_acc, best_model, save_bool = validate(val_loader, model, classifier, criterion, args, best_acc, best_model)
-            best_acc, best_model, save_bool = validate(val_loader, model, classifier, criterion, args, best_acc, best_model)
-            #acc, precision, recall, f1 = metrics
-            # save a checkpoint of model and classifier when the best score is updated
-            if save_bool:            
-                save_file = os.path.join(args.save_folder, 'best_epoch_{}.pth'.format(epoch))
-                print('Best ckpt is modified with Acc = {} when Epoch = {}'.format(best_acc[0], epoch))
-                save_model(model, optimizer, args, epoch, save_file, classifier)
+            loss, acc = train(
+                train_loader, model, classifier, domain_classifier,
+                criterion, optimizer, epoch, args, scaler
+            )
 
-             
+            best_acc, best_model, save_bool, cm, auc, all_labels, all_preds, all_probs, all_genders = validate(
+                val_loader, model, classifier, criterion, args, best_acc, best_model
+            )
 
+            if save_bool:
+                save_path = os.path.join(args.save_folder, f"best_epoch_{epoch}.pth")
+                save_model(model, optimizer, args, epoch, save_path, classifier)
+                print(f"Best model saved at epoch {epoch}")
 
             if epoch % args.save_freq == 0:
-                save_file = os.path.join(args.save_folder, 'epoch_{}.pth'.format(epoch))
-                save_model(model, optimizer, args, epoch, save_file, classifier)
+                save_path = os.path.join(args.save_folder, f"epoch_{epoch}.pth")
+                save_model(model, optimizer, args, epoch, save_path, classifier)
 
-        # save a checkpoint of classifier with the best accuracy or score
-        save_file = os.path.join(args.save_folder, 'best.pth')
+        # Load best model
         model.load_state_dict(best_model[0])
         classifier.load_state_dict(best_model[1])
-        save_model(model, optimizer, args, epoch, save_file, classifier)
+
     else:
-        print('Testing the pretrained checkpoint on {} dataset'.format(args.dataset))
-        best_acc, _, _  = validate(val_loader, model, classifier, criterion, args, best_acc)
+        best_acc, best_model, save_bool, cm, auc, all_labels, all_preds, all_probs, all_genders = validate(
+            val_loader, model, classifier, criterion, args, best_acc, best_model
+        )
+
+    ###############################################################
+    # Save ROC Curve (Option 2)
+    ###############################################################
+    roc_path = os.path.join(args.save_folder, "best_model_roc.png")
+    print('roc_path', roc_path)
+
+    fpr, tpr, _ = roc_curve(all_labels, all_probs)
+    roc_auc = calc_auc(fpr, tpr)
+
+    plt.figure(figsize=(6, 6))
+    plt.plot(fpr, tpr, label=f"AUC = {roc_auc:.2f}", lw=2)
+    plt.plot([0, 1], [0, 1], 'k--')
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curve (Best Model)")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.savefig(roc_path, dpi=300)
+    plt.close()
+
+    print(f"[ROC SAVED] {roc_path}")
+
+    ###############################################################
+    # Save Confusion Matrix (Option 3)
+    ###############################################################
+    cm_path = os.path.join(args.save_folder, "confusion_matrix.png")
+    print('cm_path', cm_path)
+
+    plt.figure(figsize=(6, 6))
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=args.cls_list)
+    disp.plot(cmap="Blues", values_format='d', ax=plt.gca(), colorbar=False)
+    plt.title("Confusion Matrix (Best Model)")
+    plt.tight_layout()
+    plt.savefig(cm_path, dpi=300)
+    plt.close()
+
+    print(f"[CONFUSION MATRIX SAVED] {cm_path}")
+
+    gender_results = validate_by_gender(all_labels, all_preds, all_probs, all_genders, args)
+
+
+    gender_groups = np.unique(all_genders)
+
+    gender_label_map = {0: "Male", 1: "Female"}
     
-    print("\n================ Final Best Results ================")
-    print(f"Best Accuracy : {best_acc[0] * 100:.2f}%")
-    print(f"Best Precision: {best_acc[1] * 100:.2f}%")
-    print(f"Best Recall   : {best_acc[2] * 100:.2f}%")
-    print(f"Best F1-Score : {best_acc[3] * 100:.2f}%")
-    print("====================================================\n")
+    for gender in gender_groups:
 
-    print("\n========== Final Evaluation (Best Model) ==========")
-    model.load_state_dict(best_model[0])
-    classifier.load_state_dict(best_model[1])
+        idxs = np.where(all_genders == gender)[0]
+        y_true = all_labels[idxs]
+        y_prob = all_probs[idxs]
+        y_pred = np.array(all_preds[idxs])
 
-    gender_results = validate_by_gender(val_loader, model, classifier, criterion, args)
+        gender_name = gender_label_map.get(gender, str(gender))   # 숫자를 문자열로 변환
 
+        # Gender-wise ROC
+        try:
+            fpr, tpr, _ = roc_curve(y_true, y_prob)
+            gender_auc = calc_auc(fpr, tpr)
+
+            plt.figure(figsize=(6, 6))
+            plt.plot(fpr, tpr, lw=2, label=f"AUC = {gender_auc:.2f}")
+            plt.plot([0, 1], [0, 1], 'k--')
+
+            plt.title(f"ROC ({gender_name})")
+            plt.xlabel("False Positive Rate")
+            plt.ylabel("True Positive Rate")
+            plt.legend()
+            plt.grid(alpha=0.3)
+            plt.savefig(os.path.join(args.save_folder, f"roc_{gender_name}.png"), dpi=300)
+            plt.close()
+
+        except:
+            print(f"[SKIP] ROC not available for {gender_name}")
+
+        # Gender-wise Confusion Matrix
+        cm_g = confusion_matrix(y_true, y_pred)
+
+        plt.figure(figsize=(6, 6))
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm_g, display_labels=args.cls_list)
+        disp.plot(cmap="Blues", values_format='d', ax=plt.gca(), colorbar=False)
+        plt.title(f"Confusion Matrix ({gender_name})")
+        plt.tight_layout()
+        plt.savefig(os.path.join(args.save_folder, f"cm_{gender_name}.png"), dpi=300)
+        plt.close()
+    print('save_folder', args.save_folder)
+
+    ###############################################################
+    # Final Save Log
+    ###############################################################
     log_dict = {
-        "BestEpoch": epoch,
         "Accuracy": best_acc[0],
         "Precision": best_acc[1],
         "Recall": best_acc[2],
         "F1": best_acc[3],
+        "AUC": best_acc[4],
         "Gender": gender_results
     }
-    
-    print('{} finished'.format(args.model_name))
 
     update_json(args.model_name, log_dict, path=os.path.join(args.save_dir, args.save_name))
-    print(f"✅ Final results saved with update_json at {args.save_name}")
-    print("=====================================================\n")
+
+    embeddings, tsne_labels, tsne_genders = extract_embeddings(val_loader, model, classifier)
+
+    # label 기준 t-SNE
+    label_names = {0: "low", 1: "high"}
+    plot_tsne_paper_style(
+        embeddings,
+        tsne_labels,
+        label_names,
+        save_path=os.path.join(args.save_folder, "tsne_label.png"),
+        title="t-SNE by Label"
+    )
+
+    # gender 기준 t-SNE
+    gender_names = {0: "Male", 1: "Female"}
+    plot_tsne_paper_style(
+        embeddings,
+        tsne_genders,
+        gender_names,
+        save_path=os.path.join(args.save_folder, "tsne_gender.png"),
+        title="t-SNE by Gender"
+    )
+
+
+
+
+    print("\n========== Training Finished ==========\n")
+    print(args.model_name)
+
     
 if __name__ == '__main__':
     main()
